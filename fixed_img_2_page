@@ -1,0 +1,190 @@
+import cv2
+import os
+import numpy as np
+import img2pdf
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import threading
+import pytesseract
+from pytesseract import Output
+
+# ⚠️ Set Tesseract path if needed
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+# ---------- CALIBRATION GLOBALS ----------
+selection = None
+dragging = False
+ix, iy = -1, -1
+
+def select_roi(event, x, y, flags, param):
+    global ix, iy, dragging, selection, img_calib_display
+    if event == cv2.EVENT_LBUTTONDOWN:
+        dragging = True
+        ix, iy = x, y
+    elif event == cv2.EVENT_MOUSEMOVE:
+        if dragging:
+            img_draw = img_calib_display.copy()
+            cv2.rectangle(img_draw, (ix, iy), (x, y), (0, 255, 0), 2)
+            cv2.imshow("Calibration: Draw Crop Area & Press ENTER", img_draw)
+    elif event == cv2.EVENT_LBUTTONUP:
+        dragging = False
+        selection = (ix, iy, x, y)
+        cv2.rectangle(img_calib_display, (ix, iy), (x, y), (0, 255, 0), 2)
+
+def calibrate_crop(first_image_path):
+    global selection, img_calib_display
+    img = cv2.imread(first_image_path)
+    if img is None: return None
+
+    # Resize for display if too large
+    h, w = img.shape[:2]
+    screen_h, screen_w = 800, 1200
+    scale = min(screen_w/w, screen_h/h)
+    img_calib_display = cv2.resize(img, (int(w*scale), int(h*scale)))
+    
+    cv2.namedWindow("Calibration: Draw Crop Area & Press ENTER")
+    cv2.setMouseCallback("Calibration: Draw Crop Area & Press ENTER", select_roi)
+
+    messagebox.showinfo("Calibration", "Draw a rectangle over the magazine and press ENTER.")
+
+    while True:
+        cv2.imshow("Calibration: Draw Crop Area & Press ENTER", img_calib_display)
+        key = cv2.waitKey(1) & 0xFF
+        if key == 13: # Enter Key
+            break
+    
+    cv2.destroyAllWindows()
+    
+    if selection:
+        # Scale coordinates back to original image size
+        x1, y1, x2, y2 = selection
+        real_x1, real_x2 = int(min(x1, x2) / scale), int(max(x1, x2) / scale)
+        real_y1, real_y2 = int(min(y1, y2) / scale), int(max(y1, y2) / scale)
+        return (real_y1, real_y2, real_x1, real_x2)
+    return None
+
+# ---------- IMAGE PROCESSING ----------
+
+def ocr_rotate(image):
+    try:
+        osd = pytesseract.image_to_osd(image, output_type=Output.DICT)
+        angle = osd.get("rotate", 0)
+        if angle == 90: return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+        elif angle == 180: return cv2.rotate(image, cv2.ROTATE_180)
+        elif angle == 270: return cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    except: pass
+    return image
+
+def denoise_image(image, strength):
+    if strength == 0: return image
+    return cv2.fastNlMeansDenoisingColored(image, None, h=strength, hColor=strength, templateWindowSize=7, searchWindowSize=21)
+
+def enhance_image(image):
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    enhanced = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+    kernel = np.array([[0,-1,0], [-1,5,-1], [0,-1,0]])
+    return cv2.filter2D(enhanced, -1, kernel)
+
+# ---------- PROCESSING ----------
+
+def process_folder(folder_path):
+    files = sorted([f for f in os.listdir(folder_path) if f.lower().endswith((".jpg", ".jpeg", ".png"))])
+    if not files:
+        messagebox.showwarning("No Images", "No images found.")
+        run_btn.config(state="normal")
+        return
+
+    # STEP 1: CALIBRATE ONCE
+    crop_coords = calibrate_crop(os.path.join(folder_path, files[0]))
+    if not crop_coords:
+        messagebox.showwarning("Cancelled", "Calibration skipped. Process aborted.")
+        run_btn.config(state="normal")
+        return
+
+    y1, y2, x1, x2 = crop_coords
+    
+    processed_path = os.path.join(folder_path, "processed")
+    os.makedirs(processed_path, exist_ok=True)
+    
+    progress_bar['maximum'] = len(files)
+    image_paths = []
+
+    for i, file in enumerate(files, start=1):
+        status_label.config(text=f"Processing: {file} ({i}/{len(files)})")
+        progress_bar['value'] = i
+        root.update_idletasks()
+
+        img = cv2.imread(os.path.join(folder_path, file))
+        if img is None: continue
+
+        # 🔥 FIXED PIPELINE
+        # 1. Fixed Crop
+        result = img[y1:y2, x1:x2]
+        
+        # 2. Correct Orientation (Standard for your samples)
+        result = cv2.rotate(result, cv2.ROTATE_180)
+        
+        # 3. Denoise & Enhance
+        result = denoise_image(result, noise_slider.get())
+        result = enhance_image(result)
+
+        save_path = os.path.join(processed_path, f"page_{i:03}.jpg")
+        cv2.imwrite(save_path, result)
+        image_paths.append(save_path)
+
+    # Compile PDF
+    status_label.config(text="Creating PDF...")
+    pdf_path = os.path.join(folder_path, f"{os.path.basename(folder_path)}.pdf")
+    with open(pdf_path, "wb") as f:
+        f.write(img2pdf.convert(image_paths))
+
+    status_label.config(text="Done!")
+    messagebox.showinfo("Done", f"PDF Created:\n{pdf_path}")
+    run_btn.config(state="normal")
+    progress_bar['value'] = 0
+
+# ---------- GUI ----------
+def select_folder():
+    folder = filedialog.askdirectory()
+    if folder:
+        entry.delete(0, tk.END)
+        entry.insert(0, folder)
+
+def run_process():
+    folder = entry.get()
+    if folder:
+        run_btn.config(state="disabled")
+        threading.Thread(target=process_folder, args=(folder,), daemon=True).start()
+
+root = tk.Tk()
+root.title("Magazine Scanner Pro (Fixed Position)")
+root.geometry("500x400")
+
+tk.Label(root, text="Select folder with images:").pack(pady=10)
+entry = tk.Entry(root, width=50)
+entry.pack()
+tk.Button(root, text="Browse", command=select_folder).pack(pady=5)
+
+status_label = tk.Label(root, text="Ready", fg="blue")
+status_label.pack(pady=5)
+
+progress_bar = ttk.Progressbar(root, orient="horizontal", length=350, mode="determinate")
+progress_bar.pack(pady=10)
+
+def update_noise_label(val):
+    noise_label.config(text=f"Noise Reduction: {int(float(val))}")
+
+noise_slider = tk.Scale(root, from_=0, to=10, orient="horizontal", length=350, label="Noise Reduction", command=update_noise_label)
+noise_slider.set(3)
+noise_slider.pack(pady=5)
+
+noise_label = tk.Label(root, text="Noise Reduction: 3", fg="gray")
+noise_label.pack()
+
+run_btn = tk.Button(root, text="Start Scan", command=run_process, bg="green", fg="white", width=20)
+run_btn.pack(pady=10)
+
+root.mainloop()
